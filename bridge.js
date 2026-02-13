@@ -1,55 +1,100 @@
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
-const MG_WS_URL = process.env.MG_WS_URL;
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
+const BOT_API_BASE = process.env.BOT_API_BASE;          // например: https://mg-s1.retailcrm.pro/api/bot/v1
+const BOT_TOKEN = process.env.BOT_TOKEN;                // токен mgBot
+const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;  // webhook Make
 
-if (!MG_WS_URL || !BOT_TOKEN || !MAKE_WEBHOOK_URL) {
-  console.error("Missing environment variables");
+if (!BOT_API_BASE || !BOT_TOKEN || !MAKE_WEBHOOK_URL) {
+  console.error("Missing environment variables: BOT_API_BASE, BOT_TOKEN, MAKE_WEBHOOK_URL");
   process.exit(1);
 }
 
-function connect() {
-  console.log("Connecting to RetailCRM MessageGateway...");
+async function getWebsocketUrl() {
+  // пробуем самый частый endpoint
+  const url = `${BOT_API_BASE.replace(/\/$/, "")}/my/websocket?types[]=message_new`;
 
-  const ws = new WebSocket(MG_WS_URL, {
-    headers: {
-      "X-Bot-Token": BOT_TOKEN
-    }
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "X-Bot-Token": BOT_TOKEN },
   });
 
-  ws.on("open", () => {
-    console.log("Connected to MG");
-  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Failed to get websocket data (${res.status}): ${text}`);
+  }
 
-  ws.on("message", async (data) => {
-    let payload;
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`WS data is not JSON: ${text}`);
+  }
 
-    try {
-      payload = JSON.parse(data.toString());
-    } catch {
-      payload = { raw: data.toString() };
-    }
+  // в разных версиях может называться по-разному — перебираем варианты
+  const wsUrl =
+    data?.url ||
+    data?.wsUrl ||
+    data?.websocketUrl ||
+    data?.connection?.url ||
+    data?.data?.url ||
+    data?.data?.connection?.url;
 
-    console.log("Event received from RetailCRM");
+  if (!wsUrl || !String(wsUrl).startsWith("ws")) {
+    throw new Error(`WebSocket URL not found in response: ${text}`);
+  }
 
-    await fetch(MAKE_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+  return wsUrl;
+}
+
+async function connect() {
+  try {
+    console.log("Getting WebSocket URL from MG...");
+    const wsUrl = await getWebsocketUrl();
+    console.log("Connecting to:", wsUrl);
+
+    const ws = new WebSocket(wsUrl);
+
+    ws.on("open", () => {
+      console.log("Connected to MG");
     });
-  });
 
-  ws.on("close", () => {
-    console.log("Disconnected. Reconnecting in 3 seconds...");
-    setTimeout(connect, 3000);
-  });
+    ws.on("message", async (data) => {
+      let payload;
 
-  ws.on("error", (err) => {
-    console.log("WS error:", err.message);
-    ws.close();
-  });
+      try {
+        payload = JSON.parse(data.toString());
+      } catch {
+        payload = { raw: data.toString() };
+      }
+
+      // защита от циклов (если вдруг прилетит событие от бота)
+      const fromType = payload?.payload?.from?.type || payload?.from?.type;
+      if (fromType === "bot") return;
+
+      await fetch(MAKE_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      console.log("Forwarded event to Make");
+    });
+
+    ws.on("close", () => {
+      console.log("Disconnected. Reconnecting in 3 seconds...");
+      setTimeout(connect, 3000);
+    });
+
+    ws.on("error", (err) => {
+      console.log("WS error:", err.message);
+      ws.close();
+    });
+  } catch (err) {
+    console.error("Startup error:", err.message);
+    console.log("Retry in 5 seconds...");
+    setTimeout(connect, 5000);
+  }
 }
 
 connect();
